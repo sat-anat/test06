@@ -1,1 +1,2 @@
 requests>=2.31
+requests-cache>=1.2
