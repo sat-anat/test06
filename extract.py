@@ -6,6 +6,12 @@
 - HTTP キャッシュ: requests-cache (1日 = 86400秒)
 - 並列取得: JS 資産を N 並列で取得
 - payload(_payload.json) を最優先し、不十分な場合は JS 資産へフォールバック
+
+使い方:
+  python extract.py \
+    --base-url "https://asmape0104.github.io/scshow-calculator/" \
+    --out cards.csv \
+    --workers 8
 """
 from __future__ import annotations
 
@@ -24,14 +30,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import requests_cache
 
+
 # requests-cache: .requests_cache/http-cache.sqlite に保存
 requests_cache.install_cache(".requests_cache/http-cache", expire_after=86400)
 
 # ────────────────────────────────────────────────────────────
-# Nuxt / assets 抽出用の正規表現（named group を確実に）
+# Nuxt / assets 抽出用の正規表現
 # ────────────────────────────────────────────────────────────
-# 例:
-# <script>window.__NUXT__.config= {public:{},app:{baseURL:"/scshow-calculator/",buildId:"cae223f9...",buildAssetsDir:"/_nuxt/",cdnURL:""}};</script>
+# 例 (index.html 内):
+# <script>window.__NUXT__.config= {public:{},app:{
+#   baseURL:"/scshow-calculator/", buildId:"<uuid>", buildAssetsDir:"/_nuxt/", cdnURL:""}}
+# </script>
 NUXT_APP_RE = re.compile(
     r'window\.__NUXT__\.config\s*=\s*\{[^{}]*app\s*:\s*\{[^}]*'
     r'baseURL"\s*:\s*"(?P<baseURL>[^"]+)"[^}]*'
@@ -40,13 +49,14 @@ NUXT_APP_RE = re.compile(
     re.S,
 )
 
-# 例: <script type="application/json" ... id="__NUXT_DATA__" data-src="/scshow-calculator/_payload.json?xxxx">
+# 例:
+# <script id="__NUXT_DATA__" ... data-src="/scshow-calculator/_payload.json?<uuid>">
 NUXT_DATA_SRC_RE = re.compile(
     r'id="__NUXT_DATA__"[^>]*\sdata-src="(?P<src>[^"]+_payload\.json[^"]*)"',
     re.S,
 )
 
-# index.html の <script / <link> から /_nuxt/*.js を拾う
+# index.html 内の <link rel="modulepreload" href=".../_nuxt/*.js"> 等
 MODULE_HREF_RE = re.compile(r'href="([^"]*/_nuxt/[^"]+\.js)"')
 ALL_JS_PATH_RE = re.compile(r'/_nuxt/[^"\'\s]+\.js')
 
@@ -92,7 +102,7 @@ class CardRow:
 def _session() -> requests.Session:
     s = requests.Session()
     s.headers.update({
-        "User-Agent": "card-extractor/1.3 (+https://asmape0104.github.io/scshow-calculator/)",
+        "User-Agent": "card-extractor/1.4 (+https://asmape0104.github.io/scshow-calculator/)",
         "Accept": "*/*",
         "Accept-Language": "ja,en;q=0.9",
         "Connection": "keep-alive",
@@ -147,9 +157,25 @@ def _extract_payload_url(html: str, base_url: str) -> Optional[str]:
     if not m:
         return None
     path = m.group("src")
-    if path.startswith("http://") or path.startswith("https://"):
+    if path.startswith(("http://", "https://")):
         return path
-    return up.urljoin(base_url, path.lstrip("/"))
+    # 先頭 "/" を保持したまま urljoin に渡す（root 相対 → origin + path）
+    return up.urljoin(base_url, path)
+
+
+def _resolve_asset_url(raw_path: str, base_url: str, baseURL_from_config: Optional[str]) -> str:
+    """
+    JS などの資産URLを安定解決。
+    - raw_path が 'http' 始まり → そのまま
+    - raw_path が '/_nuxt/...' のような「サイトルート相対」で、baseURL が '/scshow-calculator/' の場合、
+      正規は '/scshow-calculator/_nuxt/...' のことが多いので、baseURL を前置してから結合
+    - それ以外は urljoin(base_url, raw_path)
+    """
+    if raw_path.startswith(("http://", "https://")):
+        return raw_path
+    if raw_path.startswith("/_nuxt/") and baseURL_from_config:
+        raw_path = baseURL_from_config.rstrip("/") + raw_path  # "/scshow-calculator" + "/_nuxt/..." = "/scshow-calculator/_nuxt/..."
+    return up.urljoin(base_url, raw_path)
 
 
 def discover_assets_and_payload(base_url: str, session: Optional[requests.Session] = None) -> Tuple[List[str], Optional[str]]:
@@ -160,16 +186,20 @@ def discover_assets_and_payload(base_url: str, session: Optional[requests.Sessio
     js_urls: set[str] = set()
 
     baseURL, buildId, buildAssetsDir = _extract_meta_from_index(html)
-    # /_nuxt/builds/meta/<buildId>.json を辿れる場合はそこからも列挙
+
+    # /<baseURL>/_nuxt/builds/meta/<buildId>.json を辿れる場合はそこからも列挙
     if buildId and buildAssetsDir:
-        meta_url = up.urljoin(base_url, f"{buildAssetsDir.lstrip('/')}/builds/meta/{buildId}.json")
+        # buildAssetsDir は通常 "/_nuxt/"。先頭 "/" を剥がして base_url に相対結合して
+        # "/scshow-calculator/_nuxt/builds/meta/<buildId>.json" を得る
+        meta_rel = f"{buildAssetsDir.lstrip('/')}/builds/meta/{buildId}.json"
+        meta_url = up.urljoin(base_url, meta_rel)
         try:
             meta_text = fetch(meta_url, session=session)
             meta = json.loads(meta_text)
 
             def walk(v):
                 if isinstance(v, str) and v.endswith(".js") and ("/_nuxt/" in v or "/__nuxt/" in v):
-                    js_urls.add(up.urljoin(base_url, v.lstrip("/")))
+                    js_urls.add(_resolve_asset_url(v, base_url, baseURL))
                 elif isinstance(v, list):
                     for x in v:
                         walk(x)
@@ -180,8 +210,17 @@ def discover_assets_and_payload(base_url: str, session: Optional[requests.Sessio
         except Exception:
             pass
 
+    # index.html からも拾う
     for href in MODULE_HREF_RE.findall(html) + ALL_JS_PATH_RE.findall(html):
-        js_urls.add(up.urljoin(base_url, href.lstrip("/")))
+        js_urls.add(_resolve_asset_url(href, base_url, baseURL))
+
+    # debug
+    try:
+        print(f"[debug] discovered js_urls = {len(js_urls)}", file=sys.stderr)
+        for i, u in enumerate(sorted(js_urls)[:10]):
+            print(f"[debug]   js[{i}]: {u}", file=sys.stderr)
+    except Exception:
+        pass
 
     return (sorted(js_urls), payload_url)
 
@@ -417,7 +456,7 @@ def extract_all_cards(base_url: str, workers: int = 8) -> List[CardRow]:
 
 def write_csv(rows: Iterable[CardRow], out_path: str) -> None:
     rows = list(rows)
-    # Excel配慮が必要な場合は utf-8-sig（BOM付き）を推奨
+    # Excel配慮が必要な場合は utf-8-sig（BOM付き）を採用
     with io.open(out_path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.DictWriter(f, fieldnames=HEADERS)
         w.writeheader()
