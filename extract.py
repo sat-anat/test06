@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 スクショウ計算機（https://asmape0104.github.io/scshow-calculator/）から
-全カード情報を抽出して CSV を出力するスクリプト（v2.1, 2025-08-31）。
+全カード情報を抽出して CSV を出力する高速版スクリプト（v2.0, 2025-08-31）。
 
-強化点:
-- /<base_url>/_nuxt/ 系列 JS のみを強制対象化
-- JSバンドル内の 'JSON ではない' オブジェクト配列を JSON へ正規化して解析
-- JS が参照する外部 *.json の列挙・取得を可視化（URL & 成否をログ出力）
-- .mjs も対象
-- 既知フォールバックパスの少数試行（cards.json, data/cards.json 等）
-- Nuxt の _payload.json に依存しない（存在時は参考として解析）
+主なポイント:
+- /<base_url>/_nuxt/ 系列の JS のみを強制的に対象化（誤ドメイン混入を防止）
+- JS バンドル内の JSON（JSON.parse("...") / 配列の生埋め込み）を解析
+- JS が参照する外部 *.json（絶対/相対 URL）も取得して統合
+- Nuxt の _payload.json には依存しない（存在すれば参考としても解析）
+- ログ強化、重複除去、例外耐性
 
 使い方:
   python extract.py \
@@ -35,12 +34,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import requests_cache
 
-# HTTP キャッシュ
+# HTTP キャッシュ（actions/cache と連携、ローカルでも有効）
 requests_cache.install_cache(".requests_cache/http-cache", expire_after=86400)
 
 # ────────────────────────────────────────────────────────────
-# Nuxt / assets 検出
+# Nuxt / assets 抽出用の正規表現
 # ────────────────────────────────────────────────────────────
+# window.__NUXT__.config = { app: { baseURL:"/scshow-calculator/", buildId:"...", buildAssetsDir:"/_nuxt" }, ... }
 NUXT_APP_RE = re.compile(
     r'window\.__NUXT__\.config\s*=\s*\{[^{}]*app\s*:\s*\{[^}]*'
     r'baseURL"\s*:\s*"(?P<baseURL>[^"]+)"[^}]*'
@@ -48,13 +48,15 @@ NUXT_APP_RE = re.compile(
     r'buildAssetsDir"\s*:\s*"(?P<buildAssetsDir>[^"]+)"',
     re.S,
 )
+
+# <script id="__NUXT_DATA__" data-src="/scshow-calculator/_payload.json?...">
 NUXT_DATA_SRC_RE = re.compile(
     r'id="__NUXT_DATA__"[^>]*\sdata-src="(?P<src>[^"]+_payload\.json[^"]*)"', re.S
 )
 
-# JS / MJS パス抽出
-HREF_OR_SRC_ASSET_RE = re.compile(r'(?:href|src)="([^"]*?/_nuxt/[^"]+\.(?:js|mjs))"')
-ALL_ASSET_PATH_RE = re.compile(r'/_nuxt/[^"\'\s]+\.(?:js|mjs)')
+# <link rel="modulepreload" href="/scshow-calculator/_nuxt/xxx.js"> や <script src="...">
+HREF_OR_SRC_JS_RE = re.compile(r'(?:href|src)="([^"]*?/_nuxt/[^"]+\.js)"')
+ALL_JS_PATH_RE = re.compile(r'/_nuxt/[^"\'\s]+\.js')
 
 # JS 内から外部 JSON 参照（https://.../*.json, /foo/*.json, foo/*.json）
 JSON_URL_RE = re.compile(r'(?P<q>["\'])(?P<url>(?:https?://|/)[^"\']+?\.json(?:\?[^"\']*)?)\1')
@@ -93,13 +95,14 @@ class CardRow:
     source_asset: str
     last_seen: str
 
+
 # ────────────────────────────────────────────────────────────
 # HTTP
 # ────────────────────────────────────────────────────────────
 def _session() -> requests.Session:
     s = requests.Session()
     s.headers.update({
-        "User-Agent": "card-extractor/2.1 (+https://asmape0104.github.io/scshow-calculator/)",
+        "User-Agent": "card-extractor/2.0 (+https://asmape0104.github.io/scshow-calculator/)",
         "Accept": "*/*",
         "Accept-Language": "ja,en;q=0.9",
         "Connection": "keep-alive",
@@ -117,6 +120,7 @@ def fetch(url: str, session: Optional[requests.Session] = None, retries: int = 2
         except Exception as e:
             last_exc = e
             time.sleep(0.5 * (attempt + 1))
+    # 最後に例外を投げる
     raise last_exc  # type: ignore
 
 def fetch_many(urls: List[str], session: Optional[requests.Session] = None, max_workers: int = 8) -> Dict[str, Optional[str]]:
@@ -134,8 +138,9 @@ def fetch_many(urls: List[str], session: Optional[requests.Session] = None, max_
                 out[u] = None
     return out
 
+
 # ────────────────────────────────────────────────────────────
-# Nuxt assets / payload 検出
+# Nuxt assets / payload の検出
 # ────────────────────────────────────────────────────────────
 def _extract_meta_from_index(html: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     m = NUXT_APP_RE.search(html)
@@ -150,11 +155,13 @@ def _extract_payload_url(html: str, base_url: str) -> Optional[str]:
     path = m.group("src")
     if path.startswith(("http://", "https://")):
         return path
-    return up.urljoin(base_url, path)  # 先頭 "/" は root 相対のまま解決
+    # 先頭"/"は root 相対のまま urljoin に渡す
+    return up.urljoin(base_url, path)
 
 def _resolve_asset_url(raw_path: str, base_url: str, baseURL_from_config: Optional[str]) -> str:
     if raw_path.startswith(("http://", "https://")):
         return raw_path
+    # "/_nuxt/*" は baseURL があれば "/<baseURL>/_nuxt/*" に寄せる
     if raw_path.startswith("/_nuxt/") and baseURL_from_config:
         raw_path = baseURL_from_config.rstrip("/") + raw_path
     return up.urljoin(base_url, raw_path)
@@ -166,7 +173,7 @@ def discover_assets_and_payload(base_url: str, session: Optional[requests.Sessio
     js_urls: set[str] = set()
     baseURL, buildId, buildAssetsDir = _extract_meta_from_index(html)
 
-    # builds/meta/<buildId>.json から列挙
+    # builds/meta/<buildId>.json からも列挙
     if buildId and buildAssetsDir:
         meta_rel = f"{buildAssetsDir.lstrip('/')}/builds/meta/{buildId}.json"
         meta_url = up.urljoin(base_url, meta_rel)
@@ -174,7 +181,7 @@ def discover_assets_and_payload(base_url: str, session: Optional[requests.Sessio
             meta_text = fetch(meta_url, session=session)
             meta = json.loads(meta_text)
             def walk(v: Any):
-                if isinstance(v, str) and (v.endswith(".js") or v.endswith(".mjs")) and ("/_nuxt/" in v or "/__nuxt/" in v):
+                if isinstance(v, str) and v.endswith(".js") and ("/_nuxt/" in v or "/__nuxt/" in v):
                     js_urls.add(_resolve_asset_url(v, base_url, baseURL))
                 elif isinstance(v, list):
                     for x in v: walk(x)
@@ -184,11 +191,11 @@ def discover_assets_and_payload(base_url: str, session: Optional[requests.Sessio
         except Exception:
             pass
 
-    # index.html 内の <link|script> などから抽出
-    for href in HREF_OR_SRC_ASSET_RE.findall(html) + ALL_ASSET_PATH_RE.findall(html):
+    # index.html 内の <link|script> からも拾う
+    for href in HREF_OR_SRC_JS_RE.findall(html) + ALL_JS_PATH_RE.findall(html):
         js_urls.add(_resolve_asset_url(href, base_url, baseURL))
 
-    # 入力 base_url による強制フィルタ
+    # --- 必須: 入力 base_url を用いた強制フィルタ（誤系統の /_nuxt/ を除外）
     preferred_prefix = base_url.rstrip("/") + "/_nuxt/"
     js_urls = {u for u in js_urls if u.startswith(preferred_prefix)}
 
@@ -202,13 +209,15 @@ def discover_assets_and_payload(base_url: str, session: Optional[requests.Sessio
 
     return (sorted(js_urls), payload_url, baseURL)
 
+
 # ────────────────────────────────────────────────────────────
-# JS/JSON 抽出（JSON ではない JS オブジェクト配列にも対応）
+# JS/JSON 抽出
 # ────────────────────────────────────────────────────────────
 JSON_PARSE_CALL_RE = re.compile(r'JSON\.parse\(\s*(["\'])(?P<body>(?:\\.|(?!\1).)*)\1\s*\)')
 BALANCED_ARRAY_START_RE = re.compile(r'\[')
 
 def _decode_js_string_literal(s: str) -> str:
+    # JS 文字列リテラルの簡易デコード（\" や \\uXXXX を処理）
     return json.loads(f'"{s}"')
 
 def _balanced_slice(src: str, start_idx: int, open_ch: str, close_ch: str) -> Optional[str]:
@@ -229,42 +238,6 @@ def _balanced_slice(src: str, start_idx: int, open_ch: str, close_ch: str) -> Op
         i += 1
     return None
 
-def _js_like_to_json_text(js_text: str) -> Optional[str]:
-    """
-    JS オブジェクト配列っぽい文字列を JSON 文字列に正規化して返す。
-    主な処理: 単引用符→二重引用符 / キーにクオート付与 / 末尾カンマ除去 / 真偽・undefined 補正
-    """
-    t = js_text
-
-    # コメント類は極力無い前提だが、念のため /**/ を除去（簡易）
-    t = re.sub(r'/\*.*?\*/', '', t, flags=re.S)
-
-    # 単引用符の文字列をダブルクオートに（エスケープ考慮の簡易置換）
-    # まずは安全側: キーの正規化を先に行う
-    # キー: { id: , title: } → {"id": , "title": }
-    t = re.sub(r'([{\[,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)', r'\1"\2"\3', t)
-
-    # true/false/null 相当のショートハンド
-    t = t.replace('!0', 'true').replace('!1', 'false')
-    t = re.sub(r'\bundefined\b', 'null', t)
-    t = re.sub(r'\bNaN\b', 'null', t)
-
-    # 単引用符の文字列をダブルクオートに（雑に置換すると壊れるので最小限）
-    # ここでは、: '...' / [ '...' ] / , '...' , のパターンに限定して置換
-    def _sq_to_dq(m: re.Match) -> str:
-        inner = m.group(1)
-        inner = inner.replace('\\\'', '\'').replace('"', '\\"')
-        return '"' + inner + '"'
-    t = re.sub(r":\s*'([^']*)'", lambda m: ':' + _sq_to_dq(m), t)
-    t = re.sub(r",\s*'([^']*)'", lambda m: ',' + _sq_to_dq(m), t)
-    t = re.sub(r"\[\s*'([^']*)'\s*\]", lambda m: '[' + _sq_to_dq(m) + ']', t)
-
-    # 末尾カンマ削除
-    t = re.sub(r',(\s*[}\]])', r'\1', t)
-
-    # ダブルクオートで囲われていない数値の末尾などは JSON として許容されるため特別処理不要
-    return t
-
 def iter_candidate_jsons_from_js(js_text: str) -> Iterable[Any]:
     # 1) JSON.parse("...") 形式
     for m in JSON_PARSE_CALL_RE.finditer(js_text):
@@ -275,28 +248,19 @@ def iter_candidate_jsons_from_js(js_text: str) -> Iterable[Any]:
         except Exception:
             continue
 
-    # 2) バランス走査: 配列スライスを取り出し、JSON として/JS正規化後に読む
+    # 2) バランス走査（最終手段）: JSON 配列っぽい塊を拾う
     for m in BALANCED_ARRAY_START_RE.finditer(js_text):
         start = m.start()
         sliced = _balanced_slice(js_text, start, "[", "]")
         if not sliced or sliced.count("{") == 0:
             continue
-
-        # まずは JSON として直接試す
+        if not re.search(r'"\s*[\w\-\: ]+"\s*:', sliced):  # "key":
+            continue
         try:
             yield json.loads(sliced)
-            continue
         except Exception:
-            pass
+            continue
 
-        # JSON でなければ JS → JSON 正規化を試す
-        if re.search(r'[{,]\s*[A-Za-z_][A-Za-z0-9_]*\s*:', sliced):  # 未クオートキーがありそう
-            norm = _js_like_to_json_text(sliced)
-            if norm:
-                try:
-                    yield json.loads(norm)
-                except Exception:
-                    pass
 
 # ────────────────────────────────────────────────────────────
 # カード行生成
@@ -351,6 +315,7 @@ def _looks_like_card_obj(obj: Dict[str, Any]) -> bool:
     member_like = any(k in keys for k in ("member", "idol", "character"))
     stats_like = any(k in keys for k in ("smile", "pure", "cool", "mental", "hp"))
     skill_like = any(k in keys for k in ("skill_code", "skill", "skillText", "centerSkill"))
+    # 文字列中のヒント
     hint_like = any(_contains_skill_hint(v) for v in obj.values())
     member_hint = any((isinstance(v, str) and any(m in v for m in MEMBER_HINTS)) for v in obj.values())
     score = 0
@@ -360,7 +325,7 @@ def _looks_like_card_obj(obj: Dict[str, Any]) -> bool:
     score += 1 if skill_like else 0
     score += 1 if hint_like else 0
     score += 1 if member_hint else 0
-    return score >= 3
+    return score >= 3  # 閾値
 
 def extract_card_rows_from_any(value: Any, source_asset: str, rows: List[CardRow]) -> None:
     if isinstance(value, dict):
@@ -369,9 +334,11 @@ def extract_card_rows_from_any(value: Any, source_asset: str, rows: List[CardRow
                 rows.append(normalize_card_obj(value, source_asset))
             except Exception:
                 pass
+        # 再帰
         for v in value.values():
             extract_card_rows_from_any(v, source_asset, rows)
     elif isinstance(value, list):
+        # 配列が「カード辞書の配列」っぽい場合は一括処理
         dicts = [x for x in value if isinstance(x, dict)]
         if len(dicts) >= 3:
             hit = sum(1 for d in dicts if _looks_like_card_obj(d))
@@ -383,11 +350,13 @@ def extract_card_rows_from_any(value: Any, source_asset: str, rows: List[CardRow
                         except Exception:
                             pass
                 return
+        # そうでなければ個別再帰
         for v in value:
             extract_card_rows_from_any(v, source_asset, rows)
 
+
 # ────────────────────────────────────────────────────────────
-# メイン
+# メイン処理
 # ────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser()
@@ -400,7 +369,7 @@ def main():
                     help="並列取得ワーカー数")
     args = ap.parse_args()
 
-    base_url = args.base_url.rstrip("/") + "/"
+    base_url = args.base_url
     out_name = args.out_name
     workers = int(args.workers)
 
@@ -409,15 +378,15 @@ def main():
 
     sess = _session()
 
-    # 1) 資産検出
-    js_urls, payload_url, _ = discover_assets_and_payload(base_url, session=sess)
+    # 1) JS 資産と payload の検出
+    js_urls, payload_url, baseURL_from_config = discover_assets_and_payload(base_url, session=sess)
 
-    # 2) JS 取得
+    # 2) JS を取得
     js_map = fetch_many(js_urls, session=sess, max_workers=workers)
     js_ok = sum(1 for v in js_map.values() if v is not None)
     print(f"[info] fetched js assets = {js_ok}/{len(js_map)}", file=sys.stderr)
 
-    # 3) JS 内の外部 *.json を列挙（相対は base_url で解決）
+    # 3) JS 内から外部 *.json 参照を列挙（相対は base_url で解決）
     ext_json_urls: set[str] = set()
     for u, text in js_map.items():
         if not text:
@@ -425,3 +394,88 @@ def main():
         for m in JSON_URL_RE.finditer(text):
             ext_json_urls.add(m.group("url"))
         for m in REL_JSON_URL_RE.finditer(text):
+            rel = m.group("url")
+            ext_json_urls.add(up.urljoin(base_url, rel))
+
+    # 取得ドメインを base_url と同一オリジン優先に絞る（安全のため）
+    base_origin = up.urlsplit(base_url)
+    def same_origin(url: str) -> bool:
+        p = up.urlsplit(url)
+        return (p.scheme, p.netloc) == (base_origin.scheme, base_origin.netloc)
+
+    # まず同一オリジン、余力があれば全て
+    pri_urls = sorted([u for u in ext_json_urls if same_origin(u)])
+    sec_urls = sorted([u for u in ext_json_urls if not same_origin(u)])
+    # 外部オリジンは過剰取得しない
+    if len(sec_urls) > 50:
+        sec_urls = sec_urls[:50]
+
+    print(f"[info] discovered external json = {len(ext_json_urls)} "
+          f"(same-origin={len(pri_urls)}, cross-origin={len(sec_urls)})", file=sys.stderr)
+
+    # 4) 外部 *.json を取得
+    json_bodies_map: Dict[str, Optional[str]] = {}
+    if pri_urls:
+        json_bodies_map.update(fetch_many(pri_urls, session=sess, max_workers=workers))
+    if sec_urls:
+        json_bodies_map.update(fetch_many(sec_urls, session=sess, max_workers=max(2, workers // 2)))
+    json_ok = sum(1 for v in json_bodies_map.values() if v is not None)
+    print(f"[info] fetched external json = {json_ok}/{len(json_bodies_map)}", file=sys.stderr)
+
+    # 5) 候補 JSON（JS中/外部/ペイロード）を統合
+    candidates: List[Tuple[str, Any]] = []
+
+    for u, text in js_map.items():
+        if not text:
+            continue
+        for obj in iter_candidate_jsons_from_js(text):
+            candidates.append((u, obj))
+
+    for u, body in json_bodies_map.items():
+        if not body:
+            continue
+        try:
+            candidates.append((u, json.loads(body)))
+        except Exception:
+            pass
+
+    if payload_url:
+        try:
+            body = fetch(payload_url, session=sess)
+            obj = json.loads(body)
+            candidates.append((payload_url, obj))
+            print("[info] payload parsed OK", file=sys.stderr)
+        except Exception:
+            print("[warn] payload not usable (ignored)", file=sys.stderr)
+
+    print(f"[info] candidate JSON blobs = {len(candidates)}", file=sys.stderr)
+
+    # 6) カード行に正規化
+    rows: List[CardRow] = []
+    for src, obj in candidates:
+        extract_card_rows_from_any(obj, src, rows)
+
+    # 重複除去（id/title/member/rarity/ap_cost のキーで代表）
+    seen: set[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[int]]] = set()
+    unique_rows: List[CardRow] = []
+    for r in rows:
+        key = (r.id, r.title, r.member, r.rarity, r.ap_cost)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_rows.append(r)
+
+    print(f"[info] extracted rows = {len(unique_rows)}", file=sys.stderr)
+
+    # 7) CSV 出力
+    with io.open(out_name, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=HEADERS)
+        writer.writeheader()
+        for r in unique_rows:
+            writer.writerow(asdict(r))
+
+    print(f"[info] written -> {out_name}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
