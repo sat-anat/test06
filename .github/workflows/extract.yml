@@ -35,7 +35,7 @@ on:
         default: "data/cards.csv"
 
 permissions:
-  contents: write  # 最小権限でコミット可。手動実行時はOK（フォークPRは read になる点に留意）[6](https://zero-plus.io/media/how-to-page-screenshot/)[7](https://www.luft.co.jp/cgi/web-calculator.php)
+  contents: write  # 自動コミット時に必要
 
 concurrency:
   group: extract-cards-${{ github.ref }}
@@ -45,26 +45,24 @@ jobs:
   run-extract:
     name: Run extractor (cached & parallel)
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
-        uses: actions/checkout@v4  # ワークフロー実行用にリポジトリを展開 [8](https://rakko.tools/tools/125/)
+        uses: actions/checkout@v4
 
       # HTTP レスポンスキャッシュ（requests-cache のDBを保存）
       - name: Cache HTTP responses
         uses: actions/cache@v4
         with:
           path: .requests_cache
-          # base_url と extract.py の内容でキーを分離。URLに/等が入っても問題なくキー化できます。
           key: http-cache-${{ runner.os }}-${{ inputs.base_url }}-${{ hashFiles('extract.py') }}
           restore-keys: |
             http-cache-${{ runner.os }}-${{ inputs.base_url }}-
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"  # pip 依存を自動キャッシュ [3](https://ametama-sdvx.hatenablog.com/entry/2025/05/29/204137)
+          cache: "pip"
 
       - name: Install deps
         run: |
@@ -77,21 +75,19 @@ jobs:
           OUT_NAME: ${{ inputs.out_name }}
           WORKERS: ${{ inputs.workers }}
         run: |
-          echo "[info] base_url=$BASE_URL"
-          echo "[info] workers =$WORKERS"
-          python extract.py --base-url "$BASE_URL" --out "$OUT_NAME" --workers "$WORKERS"
+          echo "[info] base_url=${BASE_URL}"
+          echo "[info] workers =${WORKERS}"
+          python extract.py --base-url "${BASE_URL}" --out "${OUT_NAME}" --workers "${WORKERS}"
 
-      # 既存ブランチ上の同一パスと差分比較（差分なしなら以降の upload/commit をスキップ）
+      # 既存ブランチ上の同一パスとの差分比較（差分なしなら以降をスキップ）
       - name: Check diff with repo target (optional)
         id: diff
         if: ${{ inputs.commit_to_repo == true }}
         run: |
           set -e
           CHANGED="true"
-          # ブランチが存在すれば対象ファイルを取得して比較
           if git ls-remote --exit-code --heads origin "${{ inputs.commit_branch }}"; then
             git fetch --depth=1 origin "${{ inputs.commit_branch }}"
-            # 既存ファイルがある場合のみ比較
             if git cat-file -e "origin/${{ inputs.commit_branch }}:${{ inputs.commit_path }}" 2>/dev/null; then
               git show "origin/${{ inputs.commit_branch }}:${{ inputs.commit_path }}" > .old.csv
               if diff -q ".old.csv" "${{ inputs.out_name }}" >/dev/null; then
@@ -102,23 +98,21 @@ jobs:
           echo "changed=${CHANGED}" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact (skip if unchanged & committing)
-        if: ${{ inputs.commit_to_repo != true || steps.diff.outputs.changed == 'true' }}
+        if: ${{ inputs.commit_to_repo != true && (steps.diff.outputs.changed == 'true' || steps.diff.outputs.changed == null) }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.out_name }}
           path: ${{ inputs.out_name }}
           if-no-files-found: error
           retention-days: 30
-        # v4 は高速化・即時参照などの改良版です。[4](https://www.dospara.co.jp/tfc-pc-how-to-screenshot.html)[5](https://freesoft-100.com/pasokon/capture.html)
 
       - name: Commit to repository (only when changed)
         if: ${{ inputs.commit_to_repo == true && steps.diff.outputs.changed == 'true' }}
         run: |
           set -eux
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # 既存ブランチなら取得、なければ新規作成
           if git ls-remote --exit-code --heads origin "${{ inputs.commit_branch }}"; then
             git fetch origin "${{ inputs.commit_branch }}":"${{ inputs.commit_branch }}"
             git switch "${{ inputs.commit_branch }}"
@@ -128,7 +122,6 @@ jobs:
 
           mkdir -p "$(dirname "${{ inputs.commit_path }}")"
           cp "${{ inputs.out_name }}" "${{ inputs.commit_path }}"
-
           git add "${{ inputs.commit_path }}"
           git commit -m "chore(data): update cards CSV ($(date -u +'%Y-%m-%dT%H:%M:%SZ'))"
           git push origin "HEAD:${{ inputs.commit_branch }}"
